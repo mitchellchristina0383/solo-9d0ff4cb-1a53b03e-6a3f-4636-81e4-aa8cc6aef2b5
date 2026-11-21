@@ -77,6 +77,13 @@ class Burst(BaseModel):
     acquire_timeout: float | None = Field(30.0, description="每个请求的等连接超时")
 
 
+class PoolTarget(BaseModel):
+    # strict：只接受 JSON 整数，拒绝 4.0 / "4" / true
+    target: int = Field(
+        ..., strict=True, ge=1,
+        description="新的目标连接数（正整数）", examples=[2])
+
+
 # ---------------------------------------------------------------- 应用装配
 
 @asynccontextmanager
@@ -262,9 +269,21 @@ async def query_error(request: Request, opts: ErrorQuery | None = None):
     return await _run_query(request, opts, run)
 
 
-@app.get("/pool/stats", summary="连接池指标（在用数、等待数等）")
+@app.get("/pool/stats", summary="连接池指标（目标数、打开数、在用数、等待数等）")
 async def pool_stats(request: Request):
     return await request.app.state.pool.stats()
+
+
+@app.post("/pool/target", summary="设置目标连接数（正整数，无需重启）")
+async def set_pool_target(request: Request, body: PoolTarget):
+    """在线调整连接池目标连接数。
+
+    - 缩容：立即关闭多余的空闲连接；已借出的查询照常跑完，这些连接
+      归还时直接关闭；打开数仍高于目标期间暂停新借出和补开；
+    - 扩容：在后台补开连接，`/pool/stats` 的 `target_reached` 变为
+      true 表示已补齐；建连失败会退避重试，可用连接继续服务。
+    """
+    return await request.app.state.pool.set_target(body.target)
 
 
 @app.post("/demo/burst", summary="演示：并发打满连接池，观察排队")

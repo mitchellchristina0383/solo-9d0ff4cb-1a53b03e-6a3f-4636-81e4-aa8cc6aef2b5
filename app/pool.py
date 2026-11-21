@@ -2,12 +2,15 @@
 
 设计目标（详见 README）：
 
-- 固定数量的“槽位”：每条连接始终属于且只属于一个槽位
-  （idle / in_use / cleaning 三态之一），因此打开的连接数永远不会
-  超过池上限；
+- **目标连接数可在线调整**：每条连接始终属于一个“槽位”（idle /
+  in_use / cleaning / connecting 之一）。缩容只关闭多余的空闲连接，
+  已借出连接的查询照常跑完；打开数仍高于目标期间暂停新借出和补开；
+  建连与脏连接清理结束后，按最新接受的目标决定留用还是关闭。
 - 可能仍在执行查询的连接（客户端超时、断开）或发生过 SQL 错误的
   连接，在确认会话状态已清理之前绝不会被再次借出；无法确认的一律
-  关闭并更换新连接；
+  关闭并由后台补齐；
+- 建连失败不影响可用连接继续服务，后台按退避间隔重试，数据库恢复
+  后自动补足到目标；
 - 排队中的请求不占用连接名额，被取消后立即离开等待队列。
 """
 
@@ -17,6 +20,7 @@ import asyncio
 import inspect
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 
 import psycopg
@@ -46,10 +50,11 @@ def _consume_task_exception(task: asyncio.Task) -> None:
 @dataclass
 class PoolConfig:
     dsn: dict
-    size: int = 4
+    size: int = 4                 # 初始目标连接数（之后可在运行时调整）
     connect_timeout: float = 5.0
     startup_retries: int = 60      # 启动时等待数据库就绪的重试次数
-    retry_interval: float = 1.0
+    retry_interval: float = 1.0    # 后台建连失败后的首次退避间隔
+    max_retry_interval: float = 5.0
     cleanup_timeout: float = 10.0  # 清理单条连接的总预算
     drain_grace: float = 5.0       # 等待被取消的查询收尾的时间
     close_timeout: float = 3.0
@@ -57,6 +62,11 @@ class PoolConfig:
     # （防止数据库重启后把已死的空闲连接借给请求）；None 表示从不验证
     checkout_verify_after: float | None = 10.0
     checkout_verify_timeout: float = 3.0
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.size, bool) or not isinstance(self.size, int)
+                or self.size < 1):
+            raise ValueError("size must be a positive integer")
 
 
 class AsyncPool:
@@ -66,41 +76,114 @@ class AsyncPool:
         # 空闲连接及其进入空闲的时刻（monotonic），用于借出前活性验证
         self._idle: list[tuple[psycopg.AsyncConnection, float]] = []
         self._in_use = 0    # 已借给请求
-        self._cleaning = 0  # 正在清理/更换（不可借出）
+        self._cleaning = 0  # 正在清理/验证（仍占用打开名额，不可借出）
+        self._connecting = 0  # 正在建立连接（尚未打开，但占名额）
         self._waiting = 0   # 正在 acquire() 中排队的请求数
-        self._opened = 0    # 当前打开的连接数（<= size）
+        self._opened = 0    # 当前打开的连接数（idle + in_use + cleaning）
+        self._target = config.size  # 最新接受的目标连接数
         self._closed = False
         self._bg: set[asyncio.Task] = set()
+        self._manager: asyncio.Task | None = None
+        # 正在清理的连接对象，关停时用于兜底关闭被取消的清理任务
+        self._cleaning_conns: set[psycopg.AsyncConnection] = set()
         self.counters: dict[str, int] = {
             "acquired": 0,           # 成功借出次数
             "acquire_timeouts": 0,   # 等连接超时次数
             "queue_cancelled": 0,    # 排队中客户端取消次数
             "released_clean": 0,     # 干净归还次数
             "recycled": 0,           # 脏连接清理后复用次数
-            "replaced": 0,           # 脏连接废弃并更换次数
+            "replaced": 0,           # 脏连接废弃次数（之后由后台按目标补齐）
             "server_cancels": 0,     # 发送的服务端取消次数
             "query_timeouts": 0,     # 查询执行超时次数
             "client_disconnects": 0,  # 查询期间客户端断开次数
             "sql_errors": 0,         # SQL 报错次数
+            "resizes": 0,            # 接受的目标连接数调整次数
+            "closed_for_resize": 0,  # 因缩容而关闭的连接数
+            "opened_total": 0,       # 累计成功建立的连接数
+            "connect_failures": 0,   # 后台建连失败次数
         }
 
     # ------------------------------------------------------------ 生命周期
 
     async def start(self) -> None:
+        # 初始按 cfg.size 建满；startup_retries 用于等待数据库就绪。
         for _ in range(self.cfg.size):
             conn = await self._connect_with_retry(self.cfg.startup_retries)
-            self._idle.append((conn, time.monotonic()))
+            async with self._cond:
+                self._opened += 1
+                self.counters["opened_total"] += 1
+                self._idle.append((conn, time.monotonic()))
+        # 负责扩容 / 故障恢复后补足目标的后台任务
+        self._manager = self.spawn(self._manage())
         logger.info("pool started with %d connections", len(self._idle))
 
     async def close(self) -> None:
-        self._closed = True
-        for task in list(self._bg):
-            task.cancel()
         async with self._cond:
+            if self._closed:
+                return
+            self._closed = True
             idle, self._idle = self._idle, []
+            self._opened -= len(idle)
+            cleaning = list(self._cleaning_conns)
+            self._cleaning_conns.clear()
             self._cond.notify_all()
+        if self._manager is not None:
+            self._manager.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._manager
+        tasks = [t for t in list(self._bg) if t is not self._manager]
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
         for conn, _ in idle:
             await self._close_quietly(conn)
+        for conn in cleaning:
+            await self._close_quietly(conn)
+
+    # ------------------------------------------------------- 目标数调整
+
+    async def set_target(self, target: int) -> dict:
+        """接受新的目标连接数（正整数），返回调整后的指标快照。
+
+        - 缩容：立即关闭多余的空闲连接；已借出的连接等查询跑完再关闭；
+        - 打开数仍高于目标期间，acquire() 暂停新借出，后台也不补开；
+        - 扩容 / 补开由后台任务异步完成（建连失败会退避重试），
+          调用方可通过 /pool/stats 的 `target_reached` 判断是否已达成。
+        - 对同一目标重复调用是幂等的（no-op）。
+        """
+        if (isinstance(target, bool) or not isinstance(target, int)
+                or target < 1):
+            raise ValueError("target must be a positive integer")
+        closing: list[psycopg.AsyncConnection] = []
+        async with self._cond:
+            if self._closed:
+                raise PoolClosedError("pool is closed")
+            previous = self._target
+            self._target = target
+            if target != previous:
+                self.counters["resizes"] += 1
+            # 缩容优先关闭多余的空闲连接
+            surplus = self._opened - target
+            while surplus > 0 and self._idle:
+                conn, _ = self._idle.pop()
+                closing.append(conn)
+                self._opened -= 1
+                self.counters["closed_for_resize"] += 1
+                surplus -= 1
+            self._cond.notify_all()
+        # 先把空闲连接真正关掉再返回：调用方（如值班员）可以立即指望
+        # 这些会话已在服务端释放。关闭失败也有 close_timeout 兜底。
+        for conn in closing:
+            await self._close_quietly(conn)
+        if target != previous or closing:
+            logger.info("pool target %d -> %d (closed %d idle)",
+                        previous, target, len(closing))
+        result = await self.stats()
+        result["accepted"] = True
+        result["previous_target"] = previous
+        return result
 
     # -------------------------------------------------------- 借出 / 归还
 
@@ -110,6 +193,9 @@ class AsyncPool:
         在 `timeout` 秒内没有可用连接则抛出 AcquireTimeoutError
         （None 表示无限等待）。排队中的协程被取消时，其队列名额立即
         释放——排队请求从不持有连接名额。
+
+        缩容期间（打开数仍高于目标）暂停借出：即使有连接刚被归还，
+        也会优先关闭以收缩到目标，新的请求在目标达成后才会被唤醒。
 
         借出前如发现连接已死，或空闲时间过长且 SELECT 1 验证失败，
         则将其转入清理/更换并继续等下一条，不会把坏连接交给调用方。
@@ -134,7 +220,8 @@ class AsyncPool:
                 while True:
                     if self._closed:
                         raise PoolClosedError("pool is closed")
-                    if self._idle:
+                    # 打开数高于目标 = 仍在缩容：暂停新借出，先收缩。
+                    if self._idle and self._opened <= self._target:
                         conn, idle_since = self._idle.pop()
                         self._in_use += 1
                         self.counters["acquired"] += 1
@@ -186,22 +273,43 @@ class AsyncPool:
     ) -> None:
         """归还 acquire() 借出的连接。
 
-        干净的连接直接回到空闲队列；脏连接（查询超时 / 客户端断开 /
-        SQL 报错）转入后台清理，只有在会话状态被验证干净后才可再次
-        借出，无法验证的关闭并更换。本函数不会在清理上阻塞调用方。
+        干净的连接在目标之内直接回到空闲队列；若池正在缩容（打开数
+        高于目标），则直接关闭，不再出借。脏连接（查询超时 / 客户端
+        断开 / SQL 报错）转入后台清理，只有在会话状态被验证干净后才可
+        再次借出，无法验证的关闭并由后台按目标补齐。
         """
         if pending is not None:
             pending.add_done_callback(_consume_task_exception)
         if not dirty and self._looks_clean(conn):
             async with self._cond:
                 self._in_use -= 1
-                self._idle.append((conn, time.monotonic()))
-                self.counters["released_clean"] += 1
-                self._cond.notify(1)
+                if self._closed or self._opened > self._target:
+                    self._opened -= 1
+                    if not self._closed:
+                        self.counters["closed_for_resize"] += 1
+                    drop = True
+                else:
+                    self._idle.append((conn, time.monotonic()))
+                    self.counters["released_clean"] += 1
+                    drop = False
+                self._cond.notify_all()
+            if drop:
+                await self._close_quietly(conn)
             return
         async with self._cond:
             self._in_use -= 1
-            self._cleaning += 1
+            if self._closed:
+                # 关停中：直接关闭，不再排后台清理
+                self._opened -= 1
+                drop = True
+            else:
+                self._cleaning += 1
+                self._cleaning_conns.add(conn)
+                drop = False
+            self._cond.notify_all()
+        if drop:
+            await self._close_quietly(conn)
+            return
         self.spawn(self._recycle(conn, pending))
 
     # ------------------------------------------------------------ 内部实现
@@ -217,7 +325,7 @@ class AsyncPool:
             return False
 
     def spawn(self, coro) -> asyncio.Task:
-        """在池的后台任务集中运行一个协程（供清理与演示任务使用）。"""
+        """在池的后台任务集中运行一个协程（供清理与建连任务使用）。"""
         task = asyncio.create_task(coro)
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
@@ -225,28 +333,39 @@ class AsyncPool:
         return task
 
     async def _recycle(self, conn, pending) -> None:
+        """清理一条脏连接，并按“最新接受的目标”决定留用或关闭。"""
         try:
             ok = await self._sanitize(conn, pending)
+        except asyncio.CancelledError:
+            # 关停流程会负责关闭仍登记在 _cleaning_conns 里的连接
+            raise
         except Exception:
             logger.exception("sanitize crashed")
             ok = False
-        if ok:
-            reusable = conn
-            self.counters["recycled"] += 1
-            logger.info("dirty connection cleaned and reused")
-        else:
-            await self._close_quietly(conn)
-            self.counters["replaced"] += 1
-            if self._closed:
-                reusable = None
-            else:
-                logger.info("connection discarded; opening a replacement")
-                reusable = await self._connect_with_retry(0)  # 0 = 一直重试
         async with self._cond:
             self._cleaning -= 1
-            if reusable is not None:
-                self._idle.append((reusable, time.monotonic()))
-            self._cond.notify(1)
+            keep = ok and not self._closed and self._opened <= self._target
+            if keep:
+                self._cleaning_conns.discard(conn)
+                self._idle.append((conn, time.monotonic()))
+                self.counters["recycled"] += 1
+            else:
+                self._opened -= 1
+                if not ok:
+                    self.counters["replaced"] += 1
+                elif not self._closed:
+                    # 清理完成时目标已被调低，按最新目标关闭
+                    self.counters["closed_for_resize"] += 1
+            self._cond.notify_all()
+        if not keep:
+            if ok:
+                logger.info("cleaned connection no longer needed; closing")
+            else:
+                logger.info("connection discarded; will top up if needed")
+            await self._close_quietly(conn)
+            async with self._cond:
+                # 关闭后才摘除登记：关停流程不会漏掉正在关闭的连接
+                self._cleaning_conns.discard(conn)
 
     async def _sanitize(self, conn, pending) -> bool:
         """确认连接的会话状态已清理才返回 True。"""
@@ -301,11 +420,9 @@ class AsyncPool:
             await asyncio.wait_for(conn.close(), self.cfg.close_timeout)
         except Exception:
             logger.warning("error while closing connection", exc_info=True)
-        finally:
-            self._opened -= 1
 
     async def _connect(self) -> psycopg.AsyncConnection:
-        conn = await psycopg.AsyncConnection.connect(
+        return await psycopg.AsyncConnection.connect(
             **self.cfg.dsn,
             autocommit=True,
             application_name="ro-api",
@@ -313,8 +430,6 @@ class AsyncPool:
             # 会话级只读：本 API 是只读查询服务
             options="-c default_transaction_read_only=on",
         )
-        self._opened += 1
-        return conn
 
     async def _connect_with_retry(self, retries: int) -> psycopg.AsyncConnection:
         """retries <= 0 表示一直重试。"""
@@ -329,16 +444,71 @@ class AsyncPool:
                 logger.warning("connect failed (attempt %d), retrying", attempt)
                 await asyncio.sleep(self.cfg.retry_interval)
 
+    def _needs_conn(self) -> bool:
+        """是否需要补开：打开的 + 正在建立的仍少于目标（调用方持锁）。"""
+        return self._opened + self._connecting < self._target
+
+    async def _manage(self) -> None:
+        """后台维持目标连接数：扩容、故障恢复后补足。
+
+        串行建连（一次最多一条在途），失败的连接只影响“补开”进度，
+        不阻塞已打开连接的服务；失败后按指数退避重试，直到达成目标
+        或连接池关闭。建连完成时按“最新接受的目标”决定留用或关闭。
+        """
+        backoff = self.cfg.retry_interval
+        while True:
+            async with self._cond:
+                await self._cond.wait_for(
+                    lambda: self._closed or self._needs_conn())
+                if self._closed:
+                    return
+                self._connecting += 1
+            try:
+                conn = await self._connect()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.counters["connect_failures"] += 1
+                async with self._cond:
+                    self._connecting -= 1
+                    closed = self._closed
+                    self._cond.notify_all()
+                logger.warning("background connect failed: %s", exc)
+                if closed:
+                    return
+                # 退避；期间池关闭会取消本任务
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self.cfg.max_retry_interval)
+                continue
+            backoff = self.cfg.retry_interval
+            self.counters["opened_total"] += 1
+            async with self._cond:
+                self._connecting -= 1
+                # 以最新目标为准：建连期间目标可能已被调低
+                keep = (not self._closed) and self._opened < self._target
+                if keep:
+                    self._opened += 1
+                    self._idle.append((conn, time.monotonic()))
+                self._cond.notify_all()
+            if not keep:
+                logger.info("connection finished after shrink; closing it")
+                await self._close_quietly(conn)
+
     # ------------------------------------------------------------ 指标
 
     async def stats(self) -> dict:
         async with self._cond:
             return {
-                "size": self.cfg.size,
+                # size 保留为 target 的别名，兼容旧调用方
+                "size": self._target,
+                "target": self._target,
                 "idle": len(self._idle),
                 "in_use": self._in_use,
                 "cleaning": self._cleaning,
+                "connecting": self._connecting,
                 "waiting": self._waiting,
                 "opened_connections": self._opened,
+                "target_reached": (
+                    self._opened == self._target and self._connecting == 0),
                 "counters": dict(self.counters),
             }
